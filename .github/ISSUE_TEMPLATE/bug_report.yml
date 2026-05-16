@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible defect in the strategy package.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary / 摘要
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction / 复现步骤
+      description: Include the exact command, dataset, timezone assumption, and traceback if available.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 预期行为
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version / Python 版本
+      placeholder: "3.12.4"
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context / 其他信息

@@ -1,0 +1,493 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+// © 策略逻辑移植自 ce_zlsma_xauusd.py（CEZLSMAStrategy + everget CE + veryfid ZLSMA）
+//
+// === 使用说明（必读）===
+// 1) **Heikin Ashi 图表（推荐）**：CE / ZLSMA / 入场条件全部基于下方 **ha***（与图表 HA 一致）。默认启用 TradingView
+//    **fill_orders_on_standard_ohlc**：回测成交价、权益按 **标的真实（标准）K 线** 撮合；止损/跟随的「是否触及」用 **标准 K 的 high/low**，
+//    手数估算用 **标准 K 收盘** 近似下一根真实入场，以贴近实盘（无法在实盘中按 Heikin 合成价成交）。若要做「纯 HA 价格宇宙」自洽回测，
+//    请将 strategy() 中的 fill_orders_on_standard_ohlc 改为 false，并把 execH/execL 改回 haH/haL（见脚本内注释）。
+// 2) 普通 K 线：勾选「在普通 K 线图上使用 TV 一致 HA 序列」后 ha* 与内置 Heikin 图一致；手数、止损触价、撮合均用标准 K（见上）。
+// 3) 开仓：须在「CE 翻转当根」收盘确认时下单（barstate.isconfirmed + ceBuy），否则会再晚一根 K 才成交
+//    （若用 ceBuy[1] 在下一根才 entry，Pine 默认会再推迟到再下一根开盘价 = 比 Python 晚两根）。
+//    入场价用下一根 HA 开盘价公式 (haO+haC)/2，与 next_open 的 HA 递推一致；止损回望含信号根在内共 RISK_LOOKBACK 根。
+// 4) CE 红/绿箭头 = 仅表示 Chandelier 多空翻转；与 ce_zlsma_xauusd.py 一致，真正开仓还须「翻转当根 HA 收盘」在 ZLSMA 另一侧
+//    （多：haC>zlsma；空：haC<zlsma）。故可能出现多根红箭头但无空单：翻转时收盘仍在 ZLSMA 上方，被过滤。
+// 5) 新开仓禁开：可启用两段「每日禁开时段」（同一时区可配）；限制空仓新开与**条件反手**（纯 CE 离场不受禁开）。
+// 6) **反向 CE 离场**：持多遇 `ceSell` 或持空遇 `ceBuy`（不要求 ZLSMA），本根 HA 收盘确认后于**下一根标准 K 开盘**全部平仓。若同根另满足 ZLSMA 方向且 `entryTimeOk`，则平仓同时反手（手数算法同原 REV）；本根已触及止损线则不触发（先走持仓管理）。
+// 7) **三连阴/阳后跟踪**：持多时每根收盘若 **最近三根 HA 均为阴** 则滚动抬止损至这三根上 min(HA低,标准低) 外侧并进入跟踪；第 4 根及以后仍连阴会继续上抬止损带（不再仅用「首次三连」）。之后自下一根起用**标准 K 开盘价**与上一根收盘的 **ZLSMA** 比较；开盘在 ZLSMA 有利侧则不因当根收阴离场（仍吃移动止损）；开盘在反向侧则若当根 HA **连续收阴**则平仓。收阳则结束跟踪。空仓遇三连阳对称。
+//    抬/压止损价位取「三连对应三根上 min(HA 低, 标准低) / max(HA 高, 标准高)」再外侧偏移：避免仅用 HA 低点抬得过紧、而触价仍用标准 low 导致 HA 图上「未碰线却 STOP」。
+// 8) **分批止盈（不调止损）**：开仓冻结 `riskPx`；当标准 K **最高价**（多）/ **最低价**（空）达到「持仓均价 ± PARTIAL_TP_R×riskPx」时，按 **PARTIAL_TP_PCT** 平掉部分仓位（手数向下对齐 `LOT_STEP`）；**不**修改 `gLongStop`/`gShortStop`。每向仅触发一次。
+// 9) 手数：按「权益 × 风险% / 止损价距」换算为合约数；XAU 合约乘数因券商而异，请用「每手盎司」等输入校准。
+// 10) 关闭「标准K撮合」时，收益率会回到「纯 HA 图自洽」那种往往极高的百分比，与实盘不可比（须改 strategy() 内 fill_orders 与 exec 逻辑，见上文）。
+// 11) 头寸管理系统：不改变 CE+ZLSMA 信号本身；只在“是否允许开新仓/反手”和“该开多少仓”两处介入，并可在日内亏损、
+//     总回撤等硬风控触发后强制平仓。默认多数限制为 0=关闭，以保持旧版回测口径；需要实盘化评估时再逐项打开。
+// 12) **在 TradingView 里改参数**：点图表上本策略名称旁的 **齿轮「设置」**（或策略测试器里该策略的 **⋯ → 设置**），打开 **「输入」** 选项卡，
+//     向下滚动；「头寸管理系统」为一组可折叠输入（与 CE/ZLSMA 等参数同页）。勿在「图表设置」里找策略参数。
+//
+strategy('CE+ZLSMA (ce_zlsma_xauusd port)', overlay = true, pyramiding = 0, initial_capital = 10000, currency = currency.USD, default_qty_type = strategy.fixed, commission_type = strategy.commission.cash_per_contract, commission_value = 0.0, process_orders_on_close = false, calc_on_every_tick = false, fill_orders_on_standard_ohlc = true)
+
+//=== 与 Python 默认常量一致 ===
+int   CE_ATR_PERIOD = input.int(1, 'CE ATR 周期', minval = 1)
+float CE_MULT = input.float(2.0, 'CE ATR 乘数', step = 0.1)
+bool  CE_USE_CLOSE = input.bool(true, 'CE 极值用 close（everget useClose）')
+int   ZLSMA_LEN = input.int(50, 'ZLSMA 长度', minval = 2)
+int   ZLSMA_LINREG_OFF = input.int(0, 'ZLSMA linreg offset', minval = 0)
+int   RISK_LOOKBACK = input.int(8, '初始止损回望根数（不含当根）', minval = 1)
+float RISK_PCT = input.float(2.0, '每笔目标风险占权益 %', step = 0.1) / 100.0
+float LOT_STEP = input.float(0.01, '手数步长', step = 0.01)
+float OZ_PER_FULL_LOT = input.float(100.0, '每「1.00 手」对应标的数量（盎司）', step = 1.0)
+float MARGIN_PER_001_LOT = input.float(200.0, '每 0.01 手冻结保证金（账户货币）', step = 1.0)
+float MAX_LOTS = input.float(0.0, '单手最大手数（0=不限制）', step = 0.01)
+float POINT_TRIPLE = input.float(0.01, '三连抬/压止损：外侧偏移（与脚本 POINT 一致）', step = 0.01)
+float PARTIAL_TP_R = input.float(1.5, '分批止盈：倍数×初始风险价距（标准K极值触发）', minval = 0.1, step = 0.1)
+float PARTIAL_TP_PCT = input.float(50.0, '分批止盈：平仓占当前持仓的 %', minval = 1.0, maxval = 100.0, step = 1.0)
+
+//=== 普通 K 线图：用 TV 内置 Heikin 序列 ===
+bool USE_MANUAL_HA = input.bool(false, '在普通 K 线图上使用 TV 一致 HA 序列', tooltip = '仅在普通蜡烛图勾选。图表类型已是 Heikin Ashi 时请保持不勾选。')
+
+bool USE_ENTRY_BLOCK = input.bool(true, '启用禁开时段 1（仅限制新开仓）', tooltip = '关闭则该段不限制。')
+string NO_ENTRY_SESSION = input.session('0400-0630', '禁开时段 1（每日）', tooltip = '默认 04:00–06:30。')
+bool USE_ENTRY_BLOCK2 = input.bool(true, '启用禁开时段 2（仅限制新开仓）', tooltip = '可选第二段；与时段1同时命中则仍不可开新仓。')
+string NO_ENTRY_SESSION2 = input.session('1500-2145', '禁开时段 2（每日）', tooltip = '默认 15:00–21:45（上海）；与时段1共用下方时区。')
+string NO_ENTRY_TZ = input.string('Asia/Shanghai', '禁开时段所用时区', tooltip = '时段 1、2 均按此时区解析。')
+
+bool SHOW_EXIT_DEBUG = input.bool(false, '调试：标出止损触发根')
+
+//=== 头寸管理系统（默认不改变旧版结果；0=关闭对应限制）===
+// group 须为字面量字符串，TradingView 才能稳定显示该输入分组（勿用 string 变量作 group）
+bool  PM_ENABLE = input.bool(true, '启用头寸管理系统', group = '头寸管理系统')
+bool  PM_ALLOW_REVERSAL = input.bool(true, '允许反手（受头寸风控限制）', group = '头寸管理系统')
+float PM_MAX_MARGIN_USAGE_PCT = input.float(100.0, '最大保证金使用率 %', minval = 0.0, maxval = 100.0, step = 1.0, group = '头寸管理系统')
+float PM_MIN_STOP_PX = input.float(0.0, '最小初始止损价距（0=关闭）', minval = 0.0, step = 0.01, group = '头寸管理系统')
+float PM_MAX_STOP_PX = input.float(0.0, '最大初始止损价距（0=关闭）', minval = 0.0, step = 0.01, group = '头寸管理系统')
+int   PM_MAX_TRADES_PER_DAY = input.int(0, '每日最多开仓/反手次数（0=关闭）', minval = 0, group = '头寸管理系统')
+int   PM_COOLDOWN_BARS_AFTER_TRADE = input.int(0, '平仓后冷却 K 数（0=关闭）', minval = 0, group = '头寸管理系统')
+int   PM_COOLDOWN_BARS_AFTER_LOSS = input.int(0, '亏损平仓后冷却 K 数（0=关闭）', minval = 0, group = '头寸管理系统')
+float PM_DAILY_MAX_LOSS_PCT = input.float(0.0, '日内最大权益亏损 %（0=关闭）', minval = 0.0, step = 0.1, group = '头寸管理系统')
+float PM_DAILY_PROFIT_STOP_PCT = input.float(0.0, '日内盈利达标后停手 %（0=关闭）', minval = 0.0, step = 0.1, group = '头寸管理系统')
+float PM_TOTAL_DD_STOP_PCT = input.float(0.0, '账户峰值回撤停手 %（0=关闭）', minval = 0.0, step = 0.1, group = '头寸管理系统')
+int   PM_MAX_LOSS_STREAK = input.int(0, '最大连续亏损笔数后停手（0=关闭）', minval = 0, group = '头寸管理系统')
+bool  PM_REDUCE_RISK_AFTER_LOSSES = input.bool(false, '连亏后降低单笔风险', group = '头寸管理系统')
+int   PM_LOSS_REDUCE_FROM = input.int(2, '连亏达到 N 笔开始降风险', minval = 1, group = '头寸管理系统')
+float PM_LOSS_RISK_MULT = input.float(0.5, '连亏后风险倍率', minval = 0.0, maxval = 1.0, step = 0.05, group = '头寸管理系统')
+bool  PM_CLOSE_ON_HARD_STOP = input.bool(false, '硬风控触发时强制平仓', group = '头寸管理系统')
+bool  PM_SHOW_DASHBOARD = input.bool(true, '显示头寸管理状态面板', group = '头寸管理系统')
+
+//=== 图表 OHLC（在 HA 图上即为 HA）===
+float chartO = open
+float chartH = high
+float chartL = low
+float chartC = close
+
+//=== 与 TradingView「图表类型 = Heikin Ashi」一致的序列（普通 K 上勾选 USE_MANUAL_HA 时用）===
+[tvHaO, tvHaH, tvHaL, tvHaC] = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, [open, high, low, close], barmerge.gaps_off, barmerge.lookahead_off)
+// 标准K线：与 TV「fill_orders_on_standard_ohlc」一致，用于真实成交与触价；Heikin 图下 chart* 为 HA，std* 仍为标的真实 OHLC
+[stdO, stdH, stdL, stdC] = request.security(ticker.standard(syminfo.tickerid), timeframe.period, [open, high, low, close], barmerge.gaps_off, barmerge.lookahead_off)
+
+float haO = USE_MANUAL_HA ? tvHaO : chartO
+float haH = USE_MANUAL_HA ? tvHaH : chartH
+float haL = USE_MANUAL_HA ? tvHaL : chartL
+float haC = USE_MANUAL_HA ? tvHaC : chartC
+
+//=== 触价：标准 K high/low（与 fill_orders_on_standard_ohlc 一致）===
+float execH = stdH
+float execL = stdL
+
+//=== CE 的 ATR：基于 ha 的 TR + Wilder RMA（Pine v5 的 ta.tr() 无三参重载，手算 TR；与 ta.atr 在 HA 图上等价）===
+float haTr = math.max(haH - haL, math.max(math.abs(haH - nz(haC[1], haC)), math.abs(haL - nz(haC[1], haC))))
+float atrWild = ta.rma(haTr, CE_ATR_PERIOD)
+float atrCE = CE_MULT * atrWild
+
+//=== everget Chandelier Exit（与 chandelier_exit.pine 一致）===
+float lsRaw = (CE_USE_CLOSE ? ta.highest(haC, CE_ATR_PERIOD) : ta.highest(haH, CE_ATR_PERIOD)) - atrCE
+float ssRaw = (CE_USE_CLOSE ? ta.lowest(haC, CE_ATR_PERIOD) : ta.lowest(haL, CE_ATR_PERIOD)) + atrCE
+var float ls = na
+var float ss = na
+float lsPrev = nz(ls[1], lsRaw)
+float ssPrev = nz(ss[1], ssRaw)
+ls := haC[1] > lsPrev ? math.max(lsRaw, lsPrev) : lsRaw
+ss := haC[1] < ssPrev ? math.min(ssRaw, ssPrev) : ssRaw
+var int dir = 1
+dir := haC > ss[1] ? 1 : haC < ls[1] ? -1 : nz(dir[1], 1)
+bool ceBuy = dir == 1 and dir[1] == -1
+bool ceSell = dir == -1 and dir[1] == 1
+
+//=== veryfid ZLSMA：2*linreg(haC) - linreg(linreg(haC)) ===
+float lsma = ta.linreg(haC, ZLSMA_LEN, ZLSMA_LINREG_OFF)
+float lsma2 = ta.linreg(lsma, ZLSMA_LEN, ZLSMA_LINREG_OFF)
+float zlsma = 2.0 * lsma - lsma2
+
+//=== 时段：仅限制「新开仓」（两段并集：任一段命中且对应开关开启则禁开）===
+bool inNoEntryWindow = not na(time(timeframe.period, NO_ENTRY_SESSION, NO_ENTRY_TZ))
+bool inNoEntryWindow2 = not na(time(timeframe.period, NO_ENTRY_SESSION2, NO_ENTRY_TZ))
+bool entryBlockedNow = (USE_ENTRY_BLOCK and inNoEntryWindow) or (USE_ENTRY_BLOCK2 and inNoEntryWindow2)
+bool entryTimeOk = not entryBlockedNow
+
+//=== 信号当根收盘：回望止损含本根在内 RISK_LOOKBACK 根（与 next_open 时「不含入场当根」的 5 根一致）===
+nearLowSignalBar() =>
+    float m = haL
+    for i = 1 to RISK_LOOKBACK - 1
+        m := math.min(m, haL[i])
+    m
+
+nearHighSignalBar() =>
+    float m = haH
+    for i = 1 to RISK_LOOKBACK - 1
+        m := math.max(m, haH[i])
+    m
+
+//=== 下一根 HA 开盘价（递推恒等式，不依赖未收盘 K）===
+nextHaOpen() =>
+    (haO + haC) / 2.0
+
+//=== 最近三根 HA 全阴/全阳（含当根）：每根收盘滚动抬/压止损（与 Python `_three_bearish` / `_three_bullish` 一致）===
+bool bearLast3 = haC < haO and haC[1] < haO[1] and haC[2] < haO[2]
+bool bullLast3 = haC > haO and haC[1] > haO[1] and haC[2] > haO[2]
+
+float minLow3Ha = math.min(haL, math.min(haL[1], haL[2]))
+float minLow3Std = math.min(stdL, math.min(stdL[1], stdL[2]))
+float minLow3 = math.min(minLow3Ha, minLow3Std)
+float maxHigh3Ha = math.max(haH, math.max(haH[1], haH[2]))
+float maxHigh3Std = math.max(stdH, math.max(stdH[1], stdH[2]))
+float maxHigh3 = math.max(maxHigh3Ha, maxHigh3Std)
+
+//=== 头寸管理状态：日内权益、交易次数、连亏、冷却、总回撤 ===
+int pmDayAnchor = time('D', '0000-2359', NO_ENTRY_TZ)
+bool pmNewDay = barstate.isfirst or pmDayAnchor != nz(pmDayAnchor[1], pmDayAnchor)
+var float pmDayStartEquity = na
+var float pmPeakEquity = na
+var int   pmTradesToday = 0
+var int   pmLossStreak = 0
+var int   pmWinStreak = 0
+var int   pmLastFlatBar = na
+var int   pmLastLossFlatBar = na
+var float pmCycleStartNetProfit = na
+
+if barstate.isfirst
+    pmDayStartEquity := strategy.equity
+    pmPeakEquity := strategy.equity
+
+if pmNewDay
+    pmDayStartEquity := strategy.equity
+    pmTradesToday := 0
+
+pmPeakEquity := math.max(nz(pmPeakEquity, strategy.equity), strategy.equity)
+float pmDayPnlPct = pmDayStartEquity > 0 ? (strategy.equity / pmDayStartEquity - 1.0) * 100.0 : 0.0
+float pmTotalDdPct = pmPeakEquity > 0 ? (strategy.equity / pmPeakEquity - 1.0) * 100.0 : 0.0
+
+float pmPrevPos = nz(strategy.position_size[1], 0.0)
+bool pmPositionClosedOrReversed = pmPrevPos != 0 and (strategy.position_size == 0 or math.sign(strategy.position_size) != math.sign(pmPrevPos))
+bool pmNewPositionFilled = strategy.position_size != 0 and (pmPrevPos == 0 or math.sign(strategy.position_size) != math.sign(pmPrevPos))
+
+if pmPositionClosedOrReversed
+    float cyclePnl = strategy.netprofit - nz(pmCycleStartNetProfit, strategy.netprofit)
+    pmLastFlatBar := bar_index
+    if cyclePnl < 0
+        pmLossStreak += 1
+        pmWinStreak := 0
+        pmLastLossFlatBar := bar_index
+    else if cyclePnl > 0
+        pmWinStreak += 1
+        pmLossStreak := 0
+
+if pmNewPositionFilled
+    pmTradesToday += 1
+    pmCycleStartNetProfit := strategy.netprofit
+
+bool pmDailyLossHit = PM_ENABLE and PM_DAILY_MAX_LOSS_PCT > 0 and pmDayPnlPct <= -PM_DAILY_MAX_LOSS_PCT
+bool pmDailyProfitHit = PM_ENABLE and PM_DAILY_PROFIT_STOP_PCT > 0 and pmDayPnlPct >= PM_DAILY_PROFIT_STOP_PCT
+bool pmTotalDdHit = PM_ENABLE and PM_TOTAL_DD_STOP_PCT > 0 and pmTotalDdPct <= -PM_TOTAL_DD_STOP_PCT
+bool pmTradeLimitHit = PM_ENABLE and PM_MAX_TRADES_PER_DAY > 0 and pmTradesToday >= PM_MAX_TRADES_PER_DAY
+bool pmLossStreakHit = PM_ENABLE and PM_MAX_LOSS_STREAK > 0 and pmLossStreak >= PM_MAX_LOSS_STREAK
+bool pmCooldownTradeHit = PM_ENABLE and PM_COOLDOWN_BARS_AFTER_TRADE > 0 and not na(pmLastFlatBar) and bar_index - pmLastFlatBar < PM_COOLDOWN_BARS_AFTER_TRADE
+bool pmCooldownLossHit = PM_ENABLE and PM_COOLDOWN_BARS_AFTER_LOSS > 0 and not na(pmLastLossFlatBar) and bar_index - pmLastLossFlatBar < PM_COOLDOWN_BARS_AFTER_LOSS
+bool pmStopTradingHit = pmDailyLossHit or pmDailyProfitHit or pmTotalDdHit or pmTradeLimitHit or pmLossStreakHit or pmCooldownTradeHit or pmCooldownLossHit
+bool pmCanOpenNew = not PM_ENABLE or not pmStopTradingHit
+float pmRiskMult = PM_ENABLE and PM_REDUCE_RISK_AFTER_LOSSES and pmLossStreak >= PM_LOSS_REDUCE_FROM ? PM_LOSS_RISK_MULT : 1.0
+float pmRiskPctEff = RISK_PCT * pmRiskMult
+
+string pmBlockReason = not PM_ENABLE ? 'PM关闭' :
+     pmDailyLossHit ? '日内亏损停手' :
+     pmDailyProfitHit ? '日内盈利停手' :
+     pmTotalDdHit ? '总回撤停手' :
+     pmTradeLimitHit ? '日内次数上限' :
+     pmLossStreakHit ? '连亏停手' :
+     pmCooldownLossHit ? '亏损冷却' :
+     pmCooldownTradeHit ? '平仓冷却' : '允许开仓'
+
+string pmHardCloseReason = pmDailyLossHit ? 'PM_DAY_LOSS' : pmTotalDdHit ? 'PM_DD_STOP' : pmDailyProfitHit ? 'PM_DAY_PROFIT' : ''
+bool pmForceCloseNow = barstate.isconfirmed and PM_ENABLE and PM_CLOSE_ON_HARD_STOP and pmHardCloseReason != '' and strategy.position_size != 0
+if pmForceCloseNow
+    if strategy.position_size > 0
+        strategy.close('Long', comment = pmHardCloseReason)
+    if strategy.position_size < 0
+        strategy.close('Short', comment = pmHardCloseReason)
+
+//=== 按止损距离算手数（与 _size_units_for_stop_distance 同结构，结果以「手」交给 strategy）===
+float marginPerOz = MARGIN_PER_001_LOT / (LOT_STEP * OZ_PER_FULL_LOT)
+
+f_qtyLots(float riskPrice, float riskPct) =>
+    float adj = 0.0
+    bool riskDistanceOk = riskPrice > 1e-12
+    riskDistanceOk := riskDistanceOk and (not PM_ENABLE or PM_MIN_STOP_PX <= 0 or riskPrice >= PM_MIN_STOP_PX)
+    riskDistanceOk := riskDistanceOk and (not PM_ENABLE or PM_MAX_STOP_PX <= 0 or riskPrice <= PM_MAX_STOP_PX)
+    if riskDistanceOk and riskPct > 0
+        float eq = strategy.equity
+        float riskCash = eq * riskPct
+        float rawLots = riskCash / riskPrice / OZ_PER_FULL_LOT
+        adj := math.floor(rawLots / LOT_STEP + 1e-12) * LOT_STEP
+        adj := adj < LOT_STEP - 1e-12 ? 0.0 : adj
+        if marginPerOz > 1e-12
+            float marginCap = PM_ENABLE ? PM_MAX_MARGIN_USAGE_PCT / 100.0 : 0.999999
+            float maxU = eq * marginCap / marginPerOz
+            float maxLotsM = math.floor(maxU / OZ_PER_FULL_LOT / LOT_STEP + 1e-12) * LOT_STEP
+            adj := math.min(adj, maxLotsM)
+        if MAX_LOTS > 0
+            float cap = math.floor(MAX_LOTS / LOT_STEP + 1e-12) * LOT_STEP
+            adj := math.min(adj, cap)
+    adj
+
+f_partialCloseQty(float posContracts, float pct) =>
+    float raw = math.abs(posContracts) * (pct / 100.0)
+    math.floor(raw / LOT_STEP + 1e-12) * LOT_STEP
+
+//=== 持仓内状态（与 Python 实例变量一致；分批止盈不调止损）===
+var float gLongStop = na
+var float gShortStop = na
+var bool  gLongFollow = false
+var bool  gShortFollow = false
+var float gLongRiskInit = na
+var float gShortRiskInit = na
+var bool  gLongPartialDone = false
+var bool  gShortPartialDone = false
+
+// 仅在「刚变为空仓」时清空状态，避免在挂单尚未计入持仓的当根把止损/止盈变量清掉
+if strategy.position_size == 0 and nz(strategy.position_size[1], 0) != 0
+    gLongStop := na
+    gShortStop := na
+    gLongFollow := false
+    gShortFollow := false
+    gLongRiskInit := na
+    gShortRiskInit := na
+    gLongPartialDone := false
+    gShortPartialDone := false
+
+//=== 每根 K 计算（勿放进条件 if：满足 Pine 对 user function 每 bar 调用的要求）===
+float slSigBar = nearLowSignalBar()
+float shSigBar = nearHighSignalBar()
+float oNextSig = nextHaOpen()
+float oLongLot = stdC > slSigBar ? stdC : oNextSig
+float oShortLot = stdC < shSigBar ? stdC : oNextSig
+
+//=== 空仓新开仓：信号根收盘确认；市价单于下一根开盘成交（与 Python next_open 一致）===
+bool wantLongFlat = barstate.isconfirmed and ceBuy and haC > zlsma and strategy.position_size == 0 and entryTimeOk and pmCanOpenNew and not na(zlsma) and bar_index > ZLSMA_LEN * 2 + 5
+bool wantShortFlat = barstate.isconfirmed and ceSell and haC < zlsma and strategy.position_size == 0 and entryTimeOk and pmCanOpenNew and not na(zlsma) and bar_index > ZLSMA_LEN * 2 + 5
+
+//=== 多仓管理（bar 确认后判定；三连后跟踪见头部说明 7）===
+if barstate.isconfirmed and strategy.position_size > 0 and not pmForceCloseNow
+    if bearLast3
+        // 须先于 gLongFollow 分支：连阴延续时每根滚动抬止损，否则 follow 为真时 else 链永远走不到此处
+        gLongStop := math.max(gLongStop, minLow3 - POINT_TRIPLE)
+        gLongFollow := true
+
+    if not gLongPartialDone and not na(gLongRiskInit) and gLongRiskInit > 0
+        float epL = strategy.position_avg_price
+        if execH >= epL + PARTIAL_TP_R * gLongRiskInit
+            float qPart = f_partialCloseQty(strategy.position_size, PARTIAL_TP_PCT)
+            if qPart >= LOT_STEP - 1e-12
+                if qPart >= math.abs(strategy.position_size) - 1e-12
+                    strategy.close('Long', comment = 'PART_TP')
+                else
+                    strategy.close('Long', qty = qPart, comment = 'PART_TP')
+            gLongPartialDone := true
+
+    bool longStopNow = execL <= gLongStop
+    if SHOW_EXIT_DEBUG and longStopNow
+        label.new(bar_index, low, 'L STOP触发\nL=' + str.tostring(execL, format.mintick) + '\nstop=' + str.tostring(gLongStop, format.mintick), style = label.style_label_up, textcolor = color.white, color = color.new(color.red, 0), size = size.tiny)
+
+    if gLongFollow
+        if longStopNow
+            strategy.close('Long', comment = 'STOP')
+            gLongFollow := false
+        else
+            float zRefL = nz(zlsma[1], zlsma)
+            if na(zRefL)
+                gLongFollow := true
+            else if stdO > zRefL
+                gLongFollow := true
+            else
+                bool contBear = haC < haO and haC[1] < haO[1]
+                if contBear
+                    strategy.close('Long', comment = 'TRIP_ZLS')
+                    gLongFollow := false
+                else
+                    gLongFollow := false
+    else if longStopNow
+        strategy.close('Long', comment = 'STOP')
+        gLongFollow := false
+
+//=== 空仓管理（对称；三连阳后跟踪）===
+if barstate.isconfirmed and strategy.position_size < 0 and not pmForceCloseNow
+    if bullLast3
+        gShortStop := math.min(gShortStop, maxHigh3 + POINT_TRIPLE)
+        gShortFollow := true
+
+    if not gShortPartialDone and not na(gShortRiskInit) and gShortRiskInit > 0
+        float epS = strategy.position_avg_price
+        if execL <= epS - PARTIAL_TP_R * gShortRiskInit
+            float qPartS = f_partialCloseQty(strategy.position_size, PARTIAL_TP_PCT)
+            if qPartS >= LOT_STEP - 1e-12
+                if qPartS >= math.abs(strategy.position_size) - 1e-12
+                    strategy.close('Short', comment = 'PART_TP')
+                else
+                    strategy.close('Short', qty = qPartS, comment = 'PART_TP')
+            gShortPartialDone := true
+
+    bool shortStopNow = execH >= gShortStop
+    if SHOW_EXIT_DEBUG and shortStopNow
+        label.new(bar_index, high, 'S STOP触发\nH=' + str.tostring(execH, format.mintick) + '\nstop=' + str.tostring(gShortStop, format.mintick), style = label.style_label_down, textcolor = color.white, color = color.new(color.red, 0), size = size.tiny)
+
+    if gShortFollow
+        if shortStopNow
+            strategy.close('Short', comment = 'STOP')
+            gShortFollow := false
+        else
+            float zRefS = nz(zlsma[1], zlsma)
+            if na(zRefS)
+                gShortFollow := true
+            else if stdO < zRefS
+                gShortFollow := true
+            else
+                bool contBull = haC > haO and haC[1] > haO[1]
+                if contBull
+                    strategy.close('Short', comment = 'TRIP_ZLS')
+                    gShortFollow := false
+                else
+                    gShortFollow := false
+    else if shortStopNow
+        strategy.close('Short', comment = 'STOP')
+        gShortFollow := false
+
+//=== 反向 CE：下一根标准 K 开盘必平仓；若同根 ZLSMA 方向对且 entryTimeOk 则反手，否则仅平仓 ===
+bool ceExitLong = barstate.isconfirmed and strategy.position_size > 0 and not pmForceCloseNow and ceSell and not na(gLongStop) and execL > gLongStop and bar_index > ZLSMA_LEN * 2 + 5
+bool ceExitShort = barstate.isconfirmed and strategy.position_size < 0 and not pmForceCloseNow and ceBuy and not na(gShortStop) and execH < gShortStop and bar_index > ZLSMA_LEN * 2 + 5
+
+if ceExitLong
+    bool doRevShort = PM_ALLOW_REVERSAL and haC < zlsma and not na(zlsma) and entryTimeOk and pmCanOpenNew
+    if doRevShort
+        float shR = shSigBar
+        float riskPxSR = shR - oShortLot
+        if riskPxSR > 0 and shR > oShortLot
+            float lotsR = f_qtyLots(riskPxSR, pmRiskPctEff)
+            if lotsR >= LOT_STEP - 1e-12
+                strategy.entry('Short', strategy.short, qty = lotsR, comment = 'REV S')
+                gShortStop := shR
+                gLongStop := na
+                gLongFollow := false
+                gShortFollow := false
+                gShortRiskInit := riskPxSR
+                gShortPartialDone := false
+                gLongRiskInit := na
+                gLongPartialDone := false
+            else
+                strategy.close('Long', comment = 'CE_EXIT')
+        else
+            strategy.close('Long', comment = 'CE_EXIT')
+    else
+        strategy.close('Long', comment = 'CE_EXIT')
+
+if ceExitShort
+    bool doRevLong = PM_ALLOW_REVERSAL and haC > zlsma and not na(zlsma) and entryTimeOk and pmCanOpenNew
+    if doRevLong
+        float slR = slSigBar
+        float riskPxLR = oLongLot - slR
+        if riskPxLR > 0 and slR < oLongLot
+            float lotsRL = f_qtyLots(riskPxLR, pmRiskPctEff)
+            if lotsRL >= LOT_STEP - 1e-12
+                strategy.entry('Long', strategy.long, qty = lotsRL, comment = 'REV L')
+                gLongStop := slR
+                gShortStop := na
+                gLongFollow := false
+                gShortFollow := false
+                gLongRiskInit := riskPxLR
+                gLongPartialDone := false
+                gShortRiskInit := na
+                gShortPartialDone := false
+            else
+                strategy.close('Short', comment = 'CE_EXIT')
+        else
+            strategy.close('Short', comment = 'CE_EXIT')
+    else
+        strategy.close('Short', comment = 'CE_EXIT')
+
+if wantLongFlat
+    float sl = slSigBar
+    float riskPx = oLongLot - sl
+    if riskPx > 0 and sl < oLongLot
+        float lots = f_qtyLots(riskPx, pmRiskPctEff)
+        if lots >= LOT_STEP - 1e-12
+            strategy.entry('Long', strategy.long, qty = lots, comment = 'CE+ZLSMA L')
+            gLongStop := sl
+            gShortStop := na
+            gLongFollow := false
+            gShortFollow := false
+            gLongRiskInit := riskPx
+            gLongPartialDone := false
+            gShortRiskInit := na
+            gShortPartialDone := false
+
+if wantShortFlat
+    float sh = shSigBar
+    float riskPxS = sh - oShortLot
+    if riskPxS > 0 and sh > oShortLot
+        float lotsS = f_qtyLots(riskPxS, pmRiskPctEff)
+        if lotsS >= LOT_STEP - 1e-12
+            strategy.entry('Short', strategy.short, qty = lotsS, comment = 'CE+ZLSMA S')
+            gShortStop := sh
+            gLongStop := na
+            gLongFollow := false
+            gShortFollow := false
+            gShortRiskInit := riskPxS
+            gShortPartialDone := false
+            gLongRiskInit := na
+            gLongPartialDone := false
+
+//=== 可视化 ===
+plot(zlsma, 'ZLSMA', color = color.new(color.yellow, 0), linewidth = 2)
+plot(ls, 'CE longStop', color = color.new(color.green, 40), style = plot.style_linebr, linewidth = 1)
+plot(dir == 1 ? na : ss, 'CE shortStop', color = color.new(color.red, 40), style = plot.style_linebr, linewidth = 1)
+plot(strategy.position_size > 0 ? gLongStop : na, 'PM 多仓实际止损', color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size < 0 ? gShortStop : na, 'PM 空仓实际止损', color = color.new(color.lime, 0), style = plot.style_linebr, linewidth = 2)
+plotshape(ceBuy, title = 'CE Buy', style = shape.triangleup, location = location.belowbar, size = size.tiny, color = color.green)
+plotshape(ceSell, title = 'CE Sell', style = shape.triangledown, location = location.abovebar, size = size.tiny, color = color.red)
+bgcolor(PM_ENABLE and pmStopTradingHit ? color.new(color.gray, 92) : na, title = 'PM 禁开背景')
+
+alertcondition(pmDailyLossHit, title = 'PM 日内亏损停手', message = 'CE+ZLSMA: 日内最大亏损触发，停止新开仓。')
+alertcondition(pmDailyProfitHit, title = 'PM 日内盈利停手', message = 'CE+ZLSMA: 日内盈利目标触发，停止新开仓。')
+alertcondition(pmTotalDdHit, title = 'PM 总回撤停手', message = 'CE+ZLSMA: 账户峰值回撤阈值触发，停止新开仓。')
+alertcondition(pmLossStreakHit, title = 'PM 连亏停手', message = 'CE+ZLSMA: 连续亏损阈值触发，停止新开仓。')
+
+var table pmDash = table.new(position.top_right, 2, 9, border_width = 1)
+if PM_SHOW_DASHBOARD and barstate.islast
+    color stateBg = pmCanOpenNew ? color.new(color.green, 80) : color.new(color.red, 78)
+    table.cell(pmDash, 0, 0, '头寸管理', text_color = color.white, bgcolor = color.new(color.blue, 15))
+    table.cell(pmDash, 1, 0, pmBlockReason, text_color = color.white, bgcolor = stateBg)
+    table.cell(pmDash, 0, 1, '权益 / 日内%', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    table.cell(pmDash, 1, 1, str.tostring(strategy.equity, '#.##') + ' / ' + str.tostring(pmDayPnlPct, '#.##') + '%')
+    table.cell(pmDash, 0, 2, '峰值回撤', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    table.cell(pmDash, 1, 2, str.tostring(pmTotalDdPct, '#.##') + '%')
+    table.cell(pmDash, 0, 3, '今日交易', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    table.cell(pmDash, 1, 3, str.tostring(pmTradesToday) + (PM_MAX_TRADES_PER_DAY > 0 ? '/' + str.tostring(PM_MAX_TRADES_PER_DAY) : ''))
+    table.cell(pmDash, 0, 4, '连亏/连赢', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    table.cell(pmDash, 1, 4, str.tostring(pmLossStreak) + ' / ' + str.tostring(pmWinStreak))
+    table.cell(pmDash, 0, 5, '有效风险%', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    table.cell(pmDash, 1, 5, str.tostring(pmRiskPctEff * 100.0, '#.##') + '%')
+    table.cell(pmDash, 0, 6, '持仓手数', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    table.cell(pmDash, 1, 6, str.tostring(math.abs(strategy.position_size), '#.##'))
+    table.cell(pmDash, 0, 7, '多/空止损', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    table.cell(pmDash, 1, 7, str.tostring(gLongStop, format.mintick) + ' / ' + str.tostring(gShortStop, format.mintick))
+    table.cell(pmDash, 0, 8, '冷却剩余', text_color = color.white, bgcolor = color.new(color.gray, 35))
+    int leftTradeCd = PM_COOLDOWN_BARS_AFTER_TRADE > 0 and not na(pmLastFlatBar) ? math.max(PM_COOLDOWN_BARS_AFTER_TRADE - (bar_index - pmLastFlatBar), 0) : 0
+    int leftLossCd = PM_COOLDOWN_BARS_AFTER_LOSS > 0 and not na(pmLastLossFlatBar) ? math.max(PM_COOLDOWN_BARS_AFTER_LOSS - (bar_index - pmLastLossFlatBar), 0) : 0
+    table.cell(pmDash, 1, 8, str.tostring(leftTradeCd) + ' / ' + str.tostring(leftLossCd))

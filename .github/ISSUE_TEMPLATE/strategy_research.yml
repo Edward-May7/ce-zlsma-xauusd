@@ -1,0 +1,31 @@
+name: Strategy research
+description: Propose or discuss a research change.
+title: "[Research]: "
+labels: ["research"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Idea / 想法
+      description: What strategy, data, or reporting change should be evaluated?
+    validations:
+      required: true
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis / 假设
+      description: What result do you expect, and why?
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan / 验证计划
+      description: Dataset, timeframe, metrics, and acceptance criteria.
+  - type: checkboxes
+    id: risk
+    attributes:
+      label: Risk acknowledgement / 风险确认
+      options:
+        - label: I understand that historical backtests do not guarantee live performance.
+          required: true
